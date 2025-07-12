@@ -23,6 +23,8 @@ and place them in the `data` folder.
 
 Thanks to the [MMSSL](https://github.com/HKUDS/MMSSL) repo for sharing their datasets and codes.
 
+We have uploaded a copy of the original datasets from [MMSSL](https://github.com/HKUDS/MMSSL) to [Google Drive](https://drive.google.com/drive/folders/1HRrXJG9MYhUrK7xMi6IOTTFJNcZkQ4_6?usp=sharing).
+
 ## Running the code
 To run the code, execute the following command:
 - Baby dataset
