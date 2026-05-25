@@ -25,6 +25,20 @@ Thanks to the [MMSSL](https://github.com/HKUDS/MMSSL) repo for sharing their dat
 
 We have uploaded a copy of the original datasets from [MMSSL](https://github.com/HKUDS/MMSSL) to [Google Drive](https://drive.google.com/drive/folders/1Vb8iuk3J8-mcBxicFQt_bStZmU1zdE6R?usp=drive_link).
 
+This fork also includes a helper script for installing the author-format data:
+
+```bash
+bash scripts/download_author_data.sh
+```
+
+By default the script copies from a sibling directory named `modicf_author_data_download`.
+To download from an archive or Google Drive folder instead, set `MODICF_DATA_URL`:
+
+```bash
+MODICF_DATA_URL='https://drive.google.com/drive/folders/1Vb8iuk3J8-mcBxicFQt_bStZmU1zdE6R?usp=drive_link' \
+  bash scripts/download_author_data.sh
+```
+
 ## Running the code
 To run the code, execute the following command:
 - Baby dataset

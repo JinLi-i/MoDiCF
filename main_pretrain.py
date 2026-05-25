@@ -20,10 +20,12 @@ parser = argparse.ArgumentParser(
 
 parser.add_argument("--batch_size", type=int, default=512, help="Batch size")
 parser.add_argument("--epoch", type=int, default=1000, help="Number of training epochs")
-parser.add_argument("--lr", type=int, default=0.0001, help="Learning rate")
+parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate")
 parser.add_argument("--lr_decay", type=float, default=0.95, help="Learning rate decay factor, lr decays to lr*lr_decay")
 parser.add_argument("--lr_decay_steps", type=int, default=100, help="Learning rate decay steps")
 parser.add_argument("--seed", type=int, default=0, help="Random seed")
+parser.add_argument("--missing_seed", type=int, default=None,
+                    help="Random seed for missing-modality mask generation. Defaults to --seed.")
 
 parser.add_argument("--embed_channel", type=int, default=16, help="Embedding size")
 parser.add_argument("--embed_size", type=int, default=32, help="Embedding size")
@@ -35,10 +37,13 @@ parser.add_argument("--lambda_rec", type=float, default=1, help="Reconstruction 
 
 parser.add_argument("--dataset", type=str, default="baby", help="Dataset name")
 parser.add_argument("--MR", type=float, default=0.4, help="MR")
+parser.add_argument("--missing_mode", type=str, default="modicf", choices=["modicf", "i3_mm"],
+                    help="Missing modality sampling mode. Use i3_mm to match I3-MRec exp_mode=mm item-level missing pattern.")
 parser.add_argument("--complete", type=str, default="zero", help="Complete strategy; Options: mean, zero, mean, random, none, nn")
 parser.add_argument("--normalize", type=bool, default=True, help="Normalize data")
 parser.add_argument("--reduce_dim", type=bool, default=True, help="Reduce dimensionality")
 parser.add_argument("--dim", type=int, default=128, help="Dimensionality")
+parser.add_argument("--save_dir", type=str, default=None, help="Directory for best_model.pth and last_model.pth")
 
 args = parser.parse_args()
 
@@ -161,16 +166,20 @@ def main(args):
     MR = args.MR
     complete = args.complete
     seed = args.seed
+    missing_seed = seed if args.missing_seed is None else args.missing_seed
     isNormalize = args.normalize
     isReduceDim = args.reduce_dim
     dim = args.dim
     ori_data, incomplete_data, modalities, n_sample, input_size, missing_items, indicator, svd, min_data, max_data = (
         load_multimodal_dataset(dataset=dataset, MR=MR, complete=complete, seed=seed, device=device,
-                                normalize=isNormalize, reduced=isReduceDim, dim=dim))
+                                normalize=isNormalize, reduced=isReduceDim, dim=dim,
+                                missing_mode=args.missing_mode, missing_seed=missing_seed))
     seed_everything(seed)
 
     date_s = datetime.now().strftime('%Y%m%d%H%M%S')
-    save_path = './checkpoint/' + args.dataset + '/seed-' + str(seed) + '-' + date_s + '/'
+    save_path = args.save_dir if args.save_dir else './checkpoint/' + args.dataset + '/seed-' + str(seed) + '-' + date_s + '/'
+    if not save_path.endswith('/'):
+        save_path += '/'
     if isSave:
         if not os.path.exists(save_path):
             os.makedirs(save_path)

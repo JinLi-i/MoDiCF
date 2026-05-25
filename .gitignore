@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+data/
+checkpoint/
+logs/
+
+.DS_Store
+*.log
+*.pid

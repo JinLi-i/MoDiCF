@@ -3,28 +3,32 @@ import numpy as np
 import copy
 from utils import *
 import os
+import json
 from sklearn.decomposition import TruncatedSVD
 from sklearn.neighbors import NearestNeighbors
 
-def load_multimodal_dataset(dataset, MR, complete='zero', seed=0,
+def load_multimodal_dataset(dataset, MR, complete='zero', seed=0, missing_seed=None,
                             device=torch.device('cpu'), dtype=torch.float32,
-                            normalize=False, reduced=False, dim=100):
+                            normalize=False, reduced=False, dim=100, missing_mode='modicf'):
     root_path = './data/'
+    dataset_key = dataset[3:] if dataset.startswith('i3_') else dataset
+    path = root_path + dataset + '/'
+    if not os.path.exists(path):
+        path = root_path + dataset_key + '/'
 
-    if dataset == 'tiktok':
-        path = root_path + 'tiktok/'
+    if dataset_key == 'tiktok':
         modalities = ['image', 'text', 'audio']
 
-    elif dataset == 'baby':
-        path = root_path + 'baby/'
+    elif dataset_key == 'baby':
         modalities = ['image', 'text']
 
-    elif dataset == 'sports':
-        path = root_path + 'sports/'
+    elif dataset_key == 'sports':
         modalities = ['image', 'text']
 
-    elif dataset == 'allrecipes':
-        path = root_path + 'allrecipes/'
+    elif dataset_key == 'clothing':
+        modalities = ['image', 'text']
+
+    elif dataset_key == 'allrecipes':
         modalities = ['image', 'text']
 
     else:
@@ -54,7 +58,10 @@ def load_multimodal_dataset(dataset, MR, complete='zero', seed=0,
     if normalize:
         ori_data, min_data, max_data = normalize_data(ori_data)
 
-    incomplete_data, missing_items, indicator = incomplete(ori_data, seed=seed, rate=MR, complete=complete, path=path)
+    if missing_seed is None:
+        missing_seed = seed
+    incomplete_data, missing_items, indicator = incomplete(
+        ori_data, seed=missing_seed, rate=MR, complete=complete, path=path, missing_mode=missing_mode)
 
     ori_data = [torch.tensor(data, dtype=dtype).to(device) for data in ori_data]
     incomplete_data = [torch.tensor(data, dtype=dtype).to(device) for data in incomplete_data]
@@ -97,7 +104,7 @@ def transform_back(data, svd):
     ori_data = svd.inverse_transform(data)
     return ori_data
 
-def incomplete(fea, seed=0, rate=0.3, complete='zero', path=''):
+def incomplete(fea, seed=0, rate=0.3, complete='zero', path='', missing_mode='modicf'):
     np.random.seed(seed)
     complete = complete.lower()
 
@@ -125,16 +132,22 @@ def incomplete(fea, seed=0, rate=0.3, complete='zero', path=''):
     np.random.seed(seed)
     protected_indices = np.random.randint(n_modality, size=n_item)
 
-    candidate_data = []
+    if missing_mode == 'modicf':
+        candidate_data = []
 
-    for m in range(n_modality):
-        for sample_idx in range(n_item):
-            if protected_indices[sample_idx] != m:
-                candidate_data.append((m, sample_idx))
+        for m in range(n_modality):
+            for sample_idx in range(n_item):
+                if protected_indices[sample_idx] != m:
+                    candidate_data.append((m, sample_idx))
 
-    np.random.shuffle(candidate_data)
-    num_missing_entries = int(n_item * n_modality * rate)
-    selected_for_missing = candidate_data[:num_missing_entries]
+        np.random.shuffle(candidate_data)
+        num_missing_entries = int(n_item * n_modality * rate)
+        selected_for_missing = candidate_data[:num_missing_entries]
+    elif missing_mode == 'i3_mm':
+        selected_for_missing = i3_mm_missing_entries(path=path, missing_modality=protected_indices, rate=rate)
+        print("I3-MM missing mode: selected {} modality entries".format(len(selected_for_missing)))
+    else:
+        raise "Unimplemented missing mode"
 
     indicator = np.ones((n_item, n_modality), dtype=int)
 
@@ -205,3 +218,38 @@ def incomplete(fea, seed=0, rate=0.3, complete='zero', path=''):
     missing_items = list(missing_items)
 
     return incomplete_data, missing_items, indicator
+
+def i3_mm_missing_entries(path, missing_modality, rate=0.3):
+    train_items = read_split_items(path, 'train')
+    test_items = read_split_items(path, 'test')
+
+    test_candidate_data = list(set(test_items))
+    test_num_missing_entries = int(len(test_candidate_data) * 0.5)
+    np.random.shuffle(test_candidate_data)
+    selected_for_test_missing = test_candidate_data[:test_num_missing_entries]
+
+    train_candidate_data = list(set(train_items))
+    train_num_missing_entries = int(len(train_candidate_data) * rate)
+    np.random.shuffle(train_candidate_data)
+    selected_for_train_missing = train_candidate_data[:train_num_missing_entries]
+
+    selected_items = set(selected_for_train_missing) | set(selected_for_test_missing)
+    return [(int(missing_modality[item]), int(item)) for item in selected_items]
+
+def read_split_items(path, split):
+    json_file = os.path.join(path, split + '.json')
+    txt_file = os.path.join(path, split + '.txt')
+    items = []
+
+    if os.path.exists(json_file):
+        with open(json_file, 'r') as f:
+            data = json.load(f)
+        for values in data.values():
+            items.extend([int(item) for item in values])
+        return items
+
+    with open(txt_file, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            items.extend([int(item) for item in parts[1:]])
+    return items

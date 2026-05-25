@@ -6,6 +6,7 @@ import torch
 import numpy as np
 import pickle
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from models import *
 from parser import parse_args
@@ -15,9 +16,22 @@ from utils import *
 from data import *
 from scipy.sparse import csr_matrix
 from torch import autograd
+from torch.utils.checkpoint import checkpoint
 
 isLoad = True
 args = parse_args()
+
+def completed_data_filename():
+    missing_seed = args.seed if args.missing_seed is None else args.missing_seed
+    if args.missing_mode == 'modicf':
+        if missing_seed == args.seed:
+            return 'completed_data.pkl'
+        return 'completed_data_missingseed{}_seed{}.pkl'.format(missing_seed, args.seed)
+    rate = str(args.MR).replace('.', 'p')
+    if missing_seed == args.seed:
+        return 'completed_data_{}_seed{}_MR{}.pkl'.format(args.missing_mode, args.seed, rate)
+    return 'completed_data_{}_missingseed{}_seed{}_MR{}.pkl'.format(
+        args.missing_mode, missing_seed, args.seed, rate)
 
 def seed_everything(seed=0):
     rd.seed(seed)
@@ -27,6 +41,97 @@ def seed_everything(seed=0):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+class ExactBlockContrastiveLoss(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, z1, z2, tau, batch_size, row_blocks):
+        num_nodes = z1.size(0)
+        loss_sum = z1.new_zeros(())
+        coeff_d_list = []
+        coeff_p_list = []
+
+        for left, right in row_blocks:
+            row_z1 = z1[left:right]
+            refl_sum = row_z1.new_zeros(right - left)
+            between_sum = row_z1.new_zeros(right - left)
+            refl_diag = None
+            between_diag = None
+
+            for col_left in range(0, num_nodes, batch_size):
+                col_right = min(col_left + batch_size, num_nodes)
+                col_z1 = z1[col_left:col_right]
+                col_z2 = z2[col_left:col_right]
+                joint_sim = torch.exp(torch.mm(row_z1, torch.cat((col_z1, col_z2), dim=0).t()) / tau)
+                refl_sim, between_sim = torch.split(joint_sim, col_right - col_left, dim=1)
+
+                refl_sum = refl_sum + refl_sim.sum(1)
+                between_sum = between_sum + between_sim.sum(1)
+                if col_left == left:
+                    refl_diag = refl_sim.diag()
+                    between_diag = between_sim.diag()
+
+            denom = refl_sum + between_sum - refl_diag
+            ratio = between_diag / denom + 1e-8
+            loss_sum = loss_sum - torch.log(ratio).sum()
+            coeff_p_list.append(-1.0 / (ratio * denom))
+            coeff_d_list.append(between_diag / (ratio * denom * denom))
+
+        coeff_d = torch.cat(coeff_d_list) if coeff_d_list else z1.new_empty(0)
+        coeff_p = torch.cat(coeff_p_list) if coeff_p_list else z1.new_empty(0)
+        ctx.save_for_backward(z1, z2, coeff_d, coeff_p)
+        ctx.tau = tau
+        ctx.batch_size = batch_size
+        ctx.row_blocks = tuple(row_blocks)
+        ctx.num_nodes = num_nodes
+        return loss_sum / num_nodes
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        z1, z2, coeff_d, coeff_p = ctx.saved_tensors
+        tau = ctx.tau
+        batch_size = ctx.batch_size
+        num_nodes = ctx.num_nodes
+        grad_z1 = torch.zeros_like(z1)
+        grad_z2 = torch.zeros_like(z2)
+        offset = 0
+
+        for left, right in ctx.row_blocks:
+            row_len = right - left
+            row_z1 = z1[left:right]
+            row_coeff_d = coeff_d[offset:offset + row_len]
+            row_coeff_p = coeff_p[offset:offset + row_len]
+            offset += row_len
+
+            for col_left in range(0, num_nodes, batch_size):
+                col_right = min(col_left + batch_size, num_nodes)
+                col_z1 = z1[col_left:col_right]
+                col_z2 = z2[col_left:col_right]
+
+                joint_sim = torch.exp(torch.mm(row_z1, torch.cat((col_z1, col_z2), dim=0).t()) / tau)
+                refl_sim, between_sim = torch.split(joint_sim, col_right - col_left, dim=1)
+                refl_weight = refl_sim * row_coeff_d.unsqueeze(1)
+                between_weight = between_sim * row_coeff_d.unsqueeze(1)
+
+                if col_left == left:
+                    diag_idx = torch.arange(row_len, device=z1.device)
+                    refl_weight[diag_idx, diag_idx] = 0
+                    between_weight[diag_idx, diag_idx] = (
+                        between_weight[diag_idx, diag_idx]
+                        + between_sim[diag_idx, diag_idx] * row_coeff_p
+                    )
+
+                grad_z1[left:right] = grad_z1[left:right] + (
+                    torch.mm(refl_weight, col_z1) + torch.mm(between_weight, col_z2)
+                ) / tau
+                grad_z1[col_left:col_right] = grad_z1[col_left:col_right] + torch.mm(
+                    refl_weight.t(), row_z1) / tau
+                grad_z2[col_left:col_right] = grad_z2[col_left:col_right] + torch.mm(
+                    between_weight.t(), row_z1) / tau
+
+        scale = grad_output / num_nodes
+        return grad_z1 * scale, grad_z2 * scale, None, None, None
+
 
 class Trainer:
     def __init__(self, ori_mm_data, incomplete_mm_data, missing_items, indicator, input_size, modalities,
@@ -57,11 +162,11 @@ class Trainer:
         self.MRS_data = MRS_data
         self.dataset = args.dataset
         if isLoad:
-            completed_data_file = args.load_dir + 'completed_data.pkl'
+            completed_data_file = args.load_dir + completed_data_filename()
             if os.path.exists(completed_data_file):
-                with open(args.load_dir + 'completed_data.pkl', 'rb') as f:
+                with open(completed_data_file, 'rb') as f:
                     complete_mm_data = pickle.load(f)
-                print("Completed data loaded from: " + args.load_dir + 'completed_data.pkl')
+                print("Completed data loaded from: " + completed_data_file)
             else:
                 complete_mm_data, eval_loss = self.evaluate(next_data=incomplete_mm_data)
                 print("Complete data generated. Eval Loss: {:.4f}".format(eval_loss))
@@ -74,6 +179,12 @@ class Trainer:
         self.tester = MRS_test(data=self.MRS_data, batch_size=batch_size, test_flag=self.test_flag,
                                Ks=self.Ks, incomplete_item_num=len(missing_items))
         self.verbose = args.verbose
+        self.early_stop = args.early_stop
+        self.early_stop_split = args.early_stop_split
+        self.contrastive_batch_size = args.contrastive_batch_size
+        self.contrastive_scope = args.contrastive_scope
+        self.contrastive_impl = args.contrastive_impl
+        self.contrastive_devices = self.parse_contrastive_devices(args.contrastive_devices)
         self.anchor_rate = args.anchor_rate
         self.sample_num_ii = args.sample_num_ii
 
@@ -210,8 +321,26 @@ class Trainer:
         z2 = F.normalize(z2)
         return torch.mm(z1, z2.t())
 
-    def batched_contrastive_loss(self, z1, z2, batch_size=1024):
+    def parse_contrastive_devices(self, devices_arg):
+        devices = []
+        if torch.cuda.is_available():
+            for raw_device in str(devices_arg).split(','):
+                raw_device = raw_device.strip()
+                if raw_device == '':
+                    continue
+                device_idx = int(raw_device)
+                if device_idx < 0 or device_idx >= torch.cuda.device_count():
+                    raise ValueError(
+                        'contrastive device cuda:%d is unavailable; visible CUDA device count is %d' %
+                        (device_idx, torch.cuda.device_count()))
+                device = torch.device('cuda:%d' % device_idx)
+                if device not in devices:
+                    devices.append(device)
+        if not devices:
+            devices.append(torch.device('cuda:0' if torch.cuda.is_available() else 'cpu'))
+        return devices
 
+    def batched_contrastive_loss_original(self, z1, z2, batch_size=1024):
         device = z1.device
         num_nodes = z1.size(0)
         num_batches = (num_nodes - 1) // batch_size + 1
@@ -244,6 +373,147 @@ class Trainer:
 
         loss_vec = torch.cat(losses)
         return loss_vec.mean()
+
+    def batched_contrastive_loss_memory(self, z1, z2, batch_size=1024):
+        num_nodes = z1.size(0)
+        tau = self.tau
+        z1_norm = F.normalize(z1)
+        z2_norm = F.normalize(z2)
+
+        def block_loss(left, right, z1_all, z2_all):
+            row_z1 = z1_all[left:right]
+            refl_sum = row_z1.new_zeros(right - left)
+            between_sum = row_z1.new_zeros(right - left)
+            refl_diag = None
+            between_diag = None
+
+            for col_left in range(0, num_nodes, batch_size):
+                col_right = min(col_left + batch_size, num_nodes)
+                refl_sim = torch.exp(torch.mm(row_z1, z1_all[col_left:col_right].t()) / tau)
+                between_sim = torch.exp(torch.mm(row_z1, z2_all[col_left:col_right].t()) / tau)
+
+                refl_sum = refl_sum + refl_sim.sum(1)
+                between_sum = between_sum + between_sim.sum(1)
+                if col_left == left:
+                    refl_diag = refl_sim.diag()
+                    between_diag = between_sim.diag()
+
+            denom = refl_sum + between_sum - refl_diag
+            return -torch.log(between_diag / denom + 1e-8).sum()
+
+        loss_sum = z1.new_zeros(())
+        for left in range(0, num_nodes, batch_size):
+            right = min(left + batch_size, num_nodes)
+            loss_sum = loss_sum + checkpoint(
+                lambda z1_all, z2_all, l=left, r=right: block_loss(l, r, z1_all, z2_all),
+                z1_norm, z2_norm, use_reentrant=False, preserve_rng_state=False)
+        return loss_sum / num_nodes
+
+    def batched_contrastive_loss_memory_multigpu(self, z1, z2, batch_size=1024):
+        devices = [device for device in self.contrastive_devices if device.type == 'cuda']
+        if len(devices) <= 1:
+            return self.batched_contrastive_loss_memory(z1, z2, batch_size=batch_size)
+
+        num_nodes = z1.size(0)
+        tau = self.tau
+        output_device = z1.device
+        z1_norm = F.normalize(z1)
+        z2_norm = F.normalize(z2)
+        row_blocks = [(left, min(left + batch_size, num_nodes)) for left in range(0, num_nodes, batch_size)]
+        device_blocks = [row_blocks[i::len(devices)] for i in range(len(devices))]
+
+        def device_loss(device, blocks):
+            if not blocks:
+                return z1.new_zeros(())
+            with torch.cuda.device(device):
+                z1_all = z1_norm.to(device, non_blocking=True)
+                z2_all = z2_norm.to(device, non_blocking=True)
+                loss_sum = z1_all.new_zeros(())
+
+                def block_loss(left, right, local_z1_all, local_z2_all):
+                    row_z1 = local_z1_all[left:right]
+                    refl_sum = row_z1.new_zeros(right - left)
+                    between_sum = row_z1.new_zeros(right - left)
+                    refl_diag = None
+                    between_diag = None
+
+                    for col_left in range(0, num_nodes, batch_size):
+                        col_right = min(col_left + batch_size, num_nodes)
+                        refl_sim = torch.exp(torch.mm(row_z1, local_z1_all[col_left:col_right].t()) / tau)
+                        between_sim = torch.exp(torch.mm(row_z1, local_z2_all[col_left:col_right].t()) / tau)
+
+                        refl_sum = refl_sum + refl_sim.sum(1)
+                        between_sum = between_sum + between_sim.sum(1)
+                        if col_left == left:
+                            refl_diag = refl_sim.diag()
+                            between_diag = between_sim.diag()
+
+                    denom = refl_sum + between_sum - refl_diag
+                    return -torch.log(between_diag / denom + 1e-8).sum()
+
+                for left, right in blocks:
+                    loss_sum = loss_sum + checkpoint(
+                        lambda local_z1_all, local_z2_all, l=left, r=right: block_loss(
+                            l, r, local_z1_all, local_z2_all),
+                        z1_all, z2_all, use_reentrant=False, preserve_rng_state=False)
+                return loss_sum.to(output_device, non_blocking=True)
+
+        with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+            futures = [executor.submit(device_loss, device, blocks)
+                       for device, blocks in zip(devices, device_blocks)]
+            loss_sum = sum(future.result() for future in futures)
+        return loss_sum / num_nodes
+
+    def batched_contrastive_loss_exact(self, z1, z2, batch_size=1024):
+        num_nodes = z1.size(0)
+        z1_norm = F.normalize(z1)
+        z2_norm = F.normalize(z2)
+        row_blocks = tuple(
+            (left, min(left + batch_size, num_nodes))
+            for left in range(0, num_nodes, batch_size)
+        )
+        return ExactBlockContrastiveLoss.apply(z1_norm, z2_norm, self.tau, batch_size, row_blocks)
+
+    def batched_contrastive_loss_exact_multigpu(self, z1, z2, batch_size=1024):
+        devices = [device for device in self.contrastive_devices if device.type == 'cuda']
+        if len(devices) <= 1:
+            return self.batched_contrastive_loss_exact(z1, z2, batch_size=batch_size)
+
+        num_nodes = z1.size(0)
+        output_device = z1.device
+        z1_norm = F.normalize(z1)
+        z2_norm = F.normalize(z2)
+        row_blocks = [
+            (left, min(left + batch_size, num_nodes))
+            for left in range(0, num_nodes, batch_size)
+        ]
+        device_blocks = [tuple(row_blocks[i::len(devices)]) for i in range(len(devices))]
+
+        def device_loss(device, blocks):
+            if not blocks:
+                return z1.new_zeros(())
+            with torch.cuda.device(device):
+                z1_all = z1_norm.to(device, non_blocking=True)
+                z2_all = z2_norm.to(device, non_blocking=True)
+                loss = ExactBlockContrastiveLoss.apply(
+                    z1_all, z2_all, self.tau, batch_size, blocks)
+                return loss.to(output_device, non_blocking=True)
+
+        with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+            futures = [executor.submit(device_loss, device, blocks)
+                       for device, blocks in zip(devices, device_blocks)]
+            return sum(future.result() for future in futures)
+
+    def batched_contrastive_loss(self, z1, z2, batch_size=1024):
+        if self.contrastive_impl == 'exact':
+            if len(self.contrastive_devices) > 1 and self.contrastive_scope == 'full':
+                return self.batched_contrastive_loss_exact_multigpu(z1, z2, batch_size=batch_size)
+            return self.batched_contrastive_loss_exact(z1, z2, batch_size=batch_size)
+        if self.contrastive_impl == 'original':
+            return self.batched_contrastive_loss_original(z1, z2, batch_size=batch_size)
+        if len(self.contrastive_devices) > 1 and self.contrastive_scope == 'full':
+            return self.batched_contrastive_loss_memory_multigpu(z1, z2, batch_size=batch_size)
+        return self.batched_contrastive_loss_memory(z1, z2, batch_size=batch_size)
 
     def feat_reg_loss_calculation(self, g_mm_item, g_mm_user):
         feat_reg = 0
@@ -323,6 +593,8 @@ class Trainer:
             [], [], [], [], [], [], [], [], [])
         n_batch = self.MRS_data.n_train // self.batch_size + 1
         self.best_recall20 = 0
+        best_epoch = 0
+        early_stop_counter = 0
 
         for epoch in range(self.epoch):
             loss, diff_loss, rec_loss, mf_loss, emb_loss, reg_loss, feat_loss = 0., 0., 0., 0., 0., 0., 0.
@@ -389,7 +661,14 @@ class Trainer:
 
                 batch_contrastive_loss = 0
                 for i in range(self.n_modalities):
-                    batch_contrastive_l = self.batched_contrastive_loss(G_mm_user_id[i], G_user_emb)
+                    if self.contrastive_scope == 'batch':
+                        contrastive_z1 = G_mm_user_id[i][users]
+                        contrastive_z2 = G_user_emb[users]
+                    else:
+                        contrastive_z1 = G_mm_user_id[i]
+                        contrastive_z2 = G_user_emb
+                    batch_contrastive_l = self.batched_contrastive_loss(
+                        contrastive_z1, contrastive_z2, batch_size=self.contrastive_batch_size)
                     batch_contrastive_loss += batch_contrastive_l
 
                 batch_loss = (b_diff_loss + self.lambda_rec * b_rec_loss + G_batch_mf_loss + G_batch_emb_loss +
@@ -426,22 +705,57 @@ class Trainer:
             line_eval_rec_loss.append(rec_eval_loss)
 
             if (epoch + 1) % self.verbose == 0:
-                users_to_test = list(self.MRS_data.test_set.keys())
+                if self.early_stop_split == 'val':
+                    users_to_val = list(self.MRS_data.val_set.keys())
+                    monitor_ret = self.test(users_to_val, is_val=True)
+                    print("Val_@%s: Recall=[%.5f, %.5f, %.5f, %.5f],  precision=[%.5f, %.5f, %.5f, %.5f], hit=[%.5f, %.5f, %.5f, %.5f], "
+                          "ndcg=[%.5f, %.5f, %.5f, %.5f], Train Rec Loss=[%.5f], Eval Rec Loss=[%.5f], c=[%.5f], "
+                          "F=[%.5f, %.5f, %.5f, %.5f], F_fuse=[%.5f, %.5f, %.5f, %.5f]" % \
+                                (str(self.Ks), monitor_ret['recall'][0], monitor_ret['recall'][1], monitor_ret['recall'][2], monitor_ret['recall'][-1],
+                        monitor_ret['precision'][0], monitor_ret['precision'][1], monitor_ret['precision'][2], monitor_ret['precision'][-1], monitor_ret['hit_ratio'][0],
+                                monitor_ret['hit_ratio'][1], monitor_ret['hit_ratio'][2], monitor_ret['hit_ratio'][-1], monitor_ret['ndcg'][0], monitor_ret['ndcg'][1],
+                                monitor_ret['ndcg'][2], monitor_ret['ndcg'][-1], rec_train_loss, rec_eval_loss, monitor_ret['c'], monitor_ret['fair_p'][0],
+                                 monitor_ret['fair_p'][1], monitor_ret['fair_p'][2], monitor_ret['fair_p'][-1], monitor_ret['f_fair'][0],
+                                 monitor_ret['f_fair'][1], monitor_ret['f_fair'][2], monitor_ret['f_fair'][-1]))
+                    users_to_test = list(self.MRS_data.test_set.keys())
+                    test_ret = self.test(users_to_test, is_val=False)
+                    print("Test_@%s: Recall=[%.5f, %.5f, %.5f, %.5f],  precision=[%.5f, %.5f, %.5f, %.5f], hit=[%.5f, %.5f, %.5f, %.5f], "
+                          "ndcg=[%.5f, %.5f, %.5f, %.5f], c=[%.5f], F=[%.5f, %.5f, %.5f, %.5f], F_fuse=[%.5f, %.5f, %.5f, %.5f]" % \
+                                (str(self.Ks), test_ret['recall'][0], test_ret['recall'][1], test_ret['recall'][2], test_ret['recall'][-1],
+                        test_ret['precision'][0], test_ret['precision'][1], test_ret['precision'][2], test_ret['precision'][-1], test_ret['hit_ratio'][0],
+                                test_ret['hit_ratio'][1], test_ret['hit_ratio'][2], test_ret['hit_ratio'][-1], test_ret['ndcg'][0], test_ret['ndcg'][1],
+                                test_ret['ndcg'][2], test_ret['ndcg'][-1], test_ret['c'], test_ret['fair_p'][0], test_ret['fair_p'][1],
+                                test_ret['fair_p'][2], test_ret['fair_p'][-1], test_ret['f_fair'][0], test_ret['f_fair'][1],
+                                test_ret['f_fair'][2], test_ret['f_fair'][-1]))
+                else:
+                    users_to_test = list(self.MRS_data.test_set.keys())
+                    monitor_ret = self.test(users_to_test, is_val=False)
+                    print("Test_@%s: Recall=[%.5f, %.5f, %.5f, %.5f],  precision=[%.5f, %.5f, %.5f, %.5f], hit=[%.5f, %.5f, %.5f, %.5f], "
+                          "ndcg=[%.5f, %.5f, %.5f, %.5f], Train Rec Loss=[%.5f], Eval Rec Loss=[%.5f], c=[%.5f], "
+                          "F=[%.5f, %.5f, %.5f, %.5f], F_fuse=[%.5f, %.5f, %.5f, %.5f]" % \
+                                (str(self.Ks), monitor_ret['recall'][0], monitor_ret['recall'][1], monitor_ret['recall'][2], monitor_ret['recall'][-1],
+                        monitor_ret['precision'][0], monitor_ret['precision'][1], monitor_ret['precision'][2], monitor_ret['precision'][-1], monitor_ret['hit_ratio'][0],
+                                monitor_ret['hit_ratio'][1], monitor_ret['hit_ratio'][2], monitor_ret['hit_ratio'][-1], monitor_ret['ndcg'][0], monitor_ret['ndcg'][1],
+                                monitor_ret['ndcg'][2], monitor_ret['ndcg'][-1], rec_train_loss, rec_eval_loss, monitor_ret['c'], monitor_ret['fair_p'][0],
+                                 monitor_ret['fair_p'][1], monitor_ret['fair_p'][2], monitor_ret['fair_p'][-1], monitor_ret['f_fair'][0],
+                                 monitor_ret['f_fair'][1], monitor_ret['f_fair'][2], monitor_ret['f_fair'][-1]))
 
-                test_ret = self.test(users_to_test, is_val=False)
-
-                print("Test_@%s: Recall=[%.5f, %.5f, %.5f, %.5f],  precision=[%.5f, %.5f, %.5f, %.5f], hit=[%.5f, %.5f, %.5f, %.5f], "
-                      "ndcg=[%.5f, %.5f, %.5f, %.5f], Train Rec Loss=[%.5f], Eval Rec Loss=[%.5f], c=[%.5f], "
-                      "F=[%.5f, %.5f, %.5f, %.5f], F_fuse=[%.5f, %.5f, %.5f, %.5f]" % \
-                            (str(self.Ks), test_ret['recall'][0], test_ret['recall'][1], test_ret['recall'][2], test_ret['recall'][-1],
-                    test_ret['precision'][0], test_ret['precision'][1], test_ret['precision'][2], test_ret['precision'][-1], test_ret['hit_ratio'][0],
-                            test_ret['hit_ratio'][1], test_ret['hit_ratio'][2], test_ret['hit_ratio'][-1], test_ret['ndcg'][0], test_ret['ndcg'][1],
-                            test_ret['ndcg'][2], test_ret['ndcg'][-1], rec_train_loss, rec_eval_loss, test_ret['c'], test_ret['fair_p'][0],
-                             test_ret['fair_p'][1], test_ret['fair_p'][2], test_ret['fair_p'][-1], test_ret['f_fair'][0],
-                             test_ret['f_fair'][1], test_ret['f_fair'][2], test_ret['f_fair'][-1]))
-
-                if test_ret['recall'][2] > self.best_recall20:
-                    self.best_recall20 = test_ret['recall'][2]
+                recall20 = monitor_ret['recall'][2]
+                if recall20 > self.best_recall20:
+                    self.best_recall20 = recall20
+                    best_epoch = epoch + 1
+                    early_stop_counter = 0
+                    print("Best %s Recall@20 updated to %.5f at epoch %d" % (
+                        self.early_stop_split, self.best_recall20, best_epoch))
+                else:
+                    early_stop_counter += 1
+                    if self.early_stop > 0:
+                        print("Early stop counter: %d/%d, best %s Recall@20 %.5f at epoch %d" % (
+                            early_stop_counter, self.early_stop, self.early_stop_split, self.best_recall20, best_epoch))
+                        if early_stop_counter >= self.early_stop:
+                            print("Early stopping triggered at epoch %d. Best %s Recall@20 %.5f at epoch %d" % (
+                                epoch + 1, self.early_stop_split, self.best_recall20, best_epoch))
+                            return
             else:
                 print("Train Rec Loss=[%.5f], Eval Rec Loss=[%.5f]" % (rec_train_loss, rec_eval_loss))
 
@@ -486,9 +800,10 @@ class Trainer:
                                                        min_data=self.min_data,
                                                        max_data=self.max_data)
         print("Dataset completed. Eval Loss: {:.4f}".format(eval_loss))
-        save_file = args.load_dir + "completed_data.pkl"
+        save_file = args.load_dir + completed_data_filename()
         with open(save_file, 'wb') as f:
             pickle.dump(complete_data, f)
+        print("Completed data saved to: " + save_file)
         return complete_data, eval_loss
 
 def main(args):
@@ -497,12 +812,14 @@ def main(args):
     MR = args.MR
     complete = args.complete
     seed = args.seed
+    missing_seed = seed if args.missing_seed is None else args.missing_seed
     isNormalize = args.normalize
     isReduceDim = args.reduce_dim
     dim = args.dim
     ori_mm_data, incomplete_mm_data, modalities, n_sample, input_size, missing_items, indicator, svd, min_data, max_data = (
         load_multimodal_dataset(dataset=dataset, MR=MR, complete=complete, seed=seed, device=device,
-                                normalize=isNormalize, reduced=isReduceDim, dim=dim))
+                                normalize=isNormalize, reduced=isReduceDim, dim=dim,
+                                missing_mode=args.missing_mode, missing_seed=missing_seed))
 
     seed_everything(seed)
     embed_channel = args.embed_channel

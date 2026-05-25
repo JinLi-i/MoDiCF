@@ -34,6 +34,7 @@ class MRS_Data(object):
 
         for uid, items in test.items():
             uid = int(uid)
+            self.n_users = max(self.n_users, uid)
             try:
                 self.n_items = max(self.n_items, max(items))
                 self.n_test += len(items)
@@ -42,6 +43,7 @@ class MRS_Data(object):
 
         for uid, items in val.items():
             uid = int(uid)
+            self.n_users = max(self.n_users, uid)
             try:
                 self.n_items = max(self.n_items, max(items))
                 self.n_val += len(items)
